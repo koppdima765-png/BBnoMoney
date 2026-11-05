@@ -1,6 +1,6 @@
 """
-Telegram-бот: собирает финансовые новости из русских и английских RSS-лент,
-переводит английские на русский и постит в канал.
+Telegram-бот: собирает финансовые новости из русских RSS-лент и постит их в канал.
+Важные новости (по ключевым словам в заголовке) публикуются с картинкой, если она есть.
 
 Два режима:
   python bot.py          - работает постоянно (ПК, VPS), проверяет ленты каждые N минут
@@ -17,7 +17,6 @@ from calendar import timegm
 
 import feedparser
 import requests
-from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -31,18 +30,19 @@ MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "6"))
 DELAY_BETWEEN_POSTS = 5  # секунд между постами
 STATE_PATH = os.getenv("STATE_PATH", "seen.json")
 
-# (название, ссылка на RSS, язык "ru"/"en", фильтровать ли по ключевым словам)
-# Если лента перестала работать - замени ссылку или удали строку.
+# (название, ссылка на RSS, фильтровать ли по ключевым словам)
+# Если лента перестала работать - замени ссылку или удали строку: бот просто пропустит её.
 FEEDS = [
-    ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", "ru", True),
-    ("Коммерсантъ", "https://www.kommersant.ru/RSS/news.xml", "ru", True),
-    ("Ведомости", "https://www.vedomosti.ru/rss/news", "ru", True),
-    ("Investing.com", "https://www.investing.com/rss/news.rss", "en", False),
-    ("CNBC", "https://www.cnbc.com/id/10000664/device/rss/rss.html", "en", False),
-    ("MarketWatch", "https://feeds.content.dowjones.io/public/rss/mw_topstories", "en", False),
+    ("РБК", "https://rssexport.rbc.ru/rbcnews/news/30/full.rss", True),
+    ("Коммерсантъ", "https://www.kommersant.ru/RSS/news.xml", True),
+    ("Ведомости", "https://www.vedomosti.ru/rss/news", True),
+    ("Интерфакс", "https://www.interfax.ru/rss.asp", True),
+    ("ТАСС", "https://tass.ru/rss/v2.xml", True),
+    ("РИА Новости", "https://ria.ru/export/rss2/economy/index.xml", True),
+    ("Investing.com", "https://ru.investing.com/rss/news.rss", False),
 ]
 
-# Фильтр для общих русских лент (где последний флаг True).
+# Общий фильтр для лент, где флаг True.
 KEYWORDS = [
     "акци", "облигац", "инвест", "бирж", "ключев", "ставк", "центробанк", "цб рф",
     "инфляц", "курс доллар", "курс евро", "курс юан", "рубл", "нефт", "газпром",
@@ -50,15 +50,20 @@ KEYWORDS = [
     "ввп", "санкц", "банк", "налог", "бюджет",
 ]
 
+# Новость с таким словом в заголовке считается важной и публикуется с картинкой.
+IMPORTANT_KEYWORDS = [
+    "срочно", "молния", "ключевая ставка", "ключевую ставку", "ключевой ставки",
+    "ставку цб", "ставки цб", "рекорд", "обвал", "дефолт", "санкци", "девальвац",
+    "банкрот", "ipo", "дивиденд", "резко", "паден", "обвалил", "взлет", "взлёт",
+    "курс доллара", "курс евро", "курс юаня", "инфляци", "мосбирж", "нефть", "нефти",
+]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("news_bot")
-
-_translator = GoogleTranslator(source="auto", target="ru")
 
 
 # ---------------------------------------------------------------- состояние (что уже постили)
 def load_state() -> tuple[dict, bool]:
-    """Возвращает (словарь ключ->время, существовал ли файл раньше)."""
     if not os.path.exists(STATE_PATH):
         return {}, False
     try:
@@ -100,7 +105,7 @@ def mark_seen(state: dict, entry) -> None:
         state[k] = now
 
 
-# ---------------------------------------------------------------- ленты
+# ---------------------------------------------------------------- разбор лент
 def clean_text(text: str) -> str:
     text = re.sub(r"<[^>]+>", " ", text or "")
     text = html.unescape(text)
@@ -110,6 +115,30 @@ def clean_text(text: str) -> str:
 def matches_keywords(entry) -> bool:
     haystack = (entry.get("title", "") + " " + clean_text(entry.get("summary", ""))).lower()
     return any(k in haystack for k in KEYWORDS)
+
+
+def is_important(entry) -> bool:
+    title = (entry.get("title") or "").lower()
+    return any(k in title for k in IMPORTANT_KEYWORDS)
+
+
+def get_image(entry) -> str | None:
+    """Ищем картинку в enclosure, media-тегах или в HTML описания."""
+    for enc in entry.get("enclosures", []) or []:
+        href = enc.get("href") or enc.get("url")
+        if href and (enc.get("type", "").startswith("image") or re.search(r"\.(jpe?g|png|webp)(\?|$)", href, re.I)):
+            return href
+    for key in ("media_content", "media_thumbnail"):
+        for m in entry.get(key, []) or []:
+            if m.get("url"):
+                return m["url"]
+    blobs = [entry.get("summary", "")]
+    blobs += [c.get("value", "") for c in entry.get("content", []) or []]
+    for blob in blobs:
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', blob or "", re.I)
+        if m:
+            return html.unescape(m.group(1))
+    return None
 
 
 def entry_ts(entry) -> int:
@@ -123,9 +152,9 @@ def is_fresh(entry) -> bool:
 
 
 def fetch_entries():
-    """Список (источник, язык, entry) от старых к новым."""
+    """Список (источник, entry) от старых к новым."""
     result = []
-    for name, url, lang, use_filter in FEEDS:
+    for name, url, use_filter in FEEDS:
         try:
             resp = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0 NewsBot"})
             resp.raise_for_status()
@@ -136,52 +165,34 @@ def fetch_entries():
         for entry in feed.entries:
             if use_filter and not matches_keywords(entry):
                 continue
-            result.append((name, lang, entry))
-    result.sort(key=lambda item: entry_ts(item[2]))
+            result.append((name, entry))
+    result.sort(key=lambda item: entry_ts(item[1]))
     return result
 
 
-# ---------------------------------------------------------------- перевод и отправка
-def translate(text: str) -> str:
-    if not text:
-        return text
-    for _ in range(2):
-        try:
-            return _translator.translate(text) or text
-        except Exception as e:
-            log.warning("Ошибка перевода: %s", e)
-            time.sleep(2)
-    return text  # если перевод не удался, постим оригинал
-
-
-def format_message(source: str, lang: str, entry) -> str:
+# ---------------------------------------------------------------- отправка
+def format_message(source: str, entry) -> str:
     title = clean_text(entry.get("title", ""))
     summary = clean_text(entry.get("summary", ""))
     if len(summary) > 300:
         summary = summary[:300].rsplit(" ", 1)[0] + "…"
 
-    if lang != "ru":
-        title = translate(title)
-        summary = translate(summary)
-
     title = html.escape(title)
     summary = html.escape(summary)
     link = html.escape(entry.get("link", ""), quote=True)
-    label = f"Источник: {html.escape(source)}" + (" (перевод)" if lang != "ru" else "")
 
     parts = [f"<b>{title}</b>"]
     if summary and summary.lower() != title.lower():
         parts.append(summary)
-    parts.append(f'<a href="{link}">{label}</a>')
+    parts.append(f'<a href="{link}">Источник: {html.escape(source)}</a>')
     return "\n\n".join(parts)
 
 
-def send_to_channel(text: str) -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"}
+def tg_request(method: str, payload: dict) -> bool:
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     for _ in range(3):
         try:
-            r = requests.post(url, json=payload, timeout=20)
+            r = requests.post(url, json=payload, timeout=30)
             data = r.json()
         except Exception as e:
             log.warning("Ошибка сети при отправке: %s", e)
@@ -194,15 +205,27 @@ def send_to_channel(text: str) -> bool:
             log.warning("Лимит Telegram, ждём %s сек", wait)
             time.sleep(wait + 1)
             continue
-        log.error("Telegram вернул ошибку: %s", data)
+        log.error("Telegram вернул ошибку (%s): %s", method, data)
         return False
     return False
+
+
+def send_post(text: str, image: str | None) -> bool:
+    """Если есть картинка - шлём фото с подписью; при неудаче шлём просто текст."""
+    if image and len(text) <= 1000:  # лимит подписи к фото - 1024 символа
+        ok = tg_request("sendPhoto", {
+            "chat_id": CHANNEL_ID, "photo": image, "caption": text, "parse_mode": "HTML",
+        })
+        if ok:
+            return True
+        log.info("Фото не отправилось, публикую без картинки")
+    return tg_request("sendMessage", {"chat_id": CHANNEL_ID, "text": text, "parse_mode": "HTML"})
 
 
 # ---------------------------------------------------------------- логика
 def run_cycle(state: dict) -> None:
     posted = 0
-    for source, lang, entry in fetch_entries():
+    for source, entry in fetch_entries():
         if posted >= MAX_POSTS_PER_CYCLE:
             break
         if is_seen(state, entry):
@@ -210,10 +233,11 @@ def run_cycle(state: dict) -> None:
         if not is_fresh(entry):
             mark_seen(state, entry)
             continue
-        if send_to_channel(format_message(source, lang, entry)):
+        image = get_image(entry) if is_important(entry) else None
+        if send_post(format_message(source, entry), image):
             mark_seen(state, entry)
             posted += 1
-            log.info("Опубликовано: %s", entry.get("title", "")[:80])
+            log.info("Опубликовано%s: %s", " (с фото)" if image else "", entry.get("title", "")[:80])
             save_state(state)
             time.sleep(DELAY_BETWEEN_POSTS)
     log.info("Проход завершён, опубликовано новостей: %d", posted)
@@ -222,7 +246,7 @@ def run_cycle(state: dict) -> None:
 def bootstrap(state: dict) -> None:
     """Первый запуск: помечаем всё текущее как прочитанное, чтобы не завалить канал."""
     count = 0
-    for _, _, entry in fetch_entries():
+    for _, entry in fetch_entries():
         mark_seen(state, entry)
         count += 1
     save_state(state)
