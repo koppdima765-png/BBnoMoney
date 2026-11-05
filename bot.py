@@ -23,8 +23,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ---------------------------------------------------------------- настройки
-BOT_TOKEN = os.environ["9120563197:AAHu2zFG_AdqblSi60x9ymSLM-zuorNT-SU"]
-CHANNEL_ID = os.environ["@Business_NEWs20"]  # @my_news_channel или -100123456789
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+CHANNEL_ID = os.environ["CHANNEL_ID"]  # @my_news_channel или -100123456789
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_MIN", "10")) * 60
 MAX_POSTS_PER_CYCLE = int(os.getenv("MAX_POSTS_PER_CYCLE", "5"))
 MAX_AGE_HOURS = int(os.getenv("MAX_AGE_HOURS", "6"))
